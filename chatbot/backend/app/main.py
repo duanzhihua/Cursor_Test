@@ -1,9 +1,19 @@
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.routers import health, chat, models
+from app.database.db import init_db
+from app.routers import chat, health, models, session
 
-app = FastAPI(title="ChatBot API", version="0.1.0")
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    await init_db()
+    yield
+
+
+app = FastAPI(title="ChatBot API", version="0.5.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -16,3 +26,4 @@ app.add_middleware(
 app.include_router(health.router)
 app.include_router(chat.router)
 app.include_router(models.router)
+app.include_router(session.router)

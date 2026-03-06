@@ -1,43 +1,91 @@
-import type { Message, ModelType, ModelInfo, SSEEvent } from "../types";
+import type {
+  ModelInfo,
+  ModelType,
+  Session,
+  SessionDetail,
+  SSEEvent,
+} from "../types";
 
 interface SendMessageParams {
+  sessionId: string;
   message: string;
   model: ModelType;
-  history: Message[];
   onReasoning: (token: string) => void;
   onContent: (token: string) => void;
-  onDone: (usage?: SSEEvent["usage"]) => void;
-  onError: (error: string) => void;
+  onDone: (usage?: SSEEvent["usage"]) => void | Promise<void>;
+  onError: (error: string) => void | Promise<void>;
+  signal?: AbortSignal;
+}
+
+async function requestJson<T>(url: string, init?: RequestInit): Promise<T> {
+  const res = await fetch(url, init);
+  if (!res.ok) {
+    throw new Error(`HTTP ${res.status}`);
+  }
+
+  if (res.status === 204) {
+    return undefined as T;
+  }
+
+  return res.json() as Promise<T>;
 }
 
 export async function fetchModels(): Promise<ModelInfo[]> {
   try {
-    const res = await fetch("/api/models");
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    return await res.json();
+    return await requestJson<ModelInfo[]>("/api/models");
   } catch {
     console.error("Failed to fetch models, using defaults");
     return [];
   }
 }
 
+export async function fetchSessions(): Promise<Session[]> {
+  return requestJson<Session[]>("/api/sessions");
+}
+
+export async function fetchSessionDetail(sessionId: string): Promise<SessionDetail> {
+  return requestJson<SessionDetail>(`/api/sessions/${sessionId}`);
+}
+
+export async function createSession(model: ModelType): Promise<Session> {
+  return requestJson<Session>("/api/sessions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      title: "新对话",
+      default_model: model,
+    }),
+  });
+}
+
+export async function renameSession(sessionId: string, title: string): Promise<Session> {
+  return requestJson<Session>(`/api/sessions/${sessionId}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ title }),
+  });
+}
+
+export async function deleteSession(sessionId: string): Promise<void> {
+  await requestJson<void>(`/api/sessions/${sessionId}`, {
+    method: "DELETE",
+  });
+}
+
 export async function sendMessage({
+  sessionId,
   message,
   model,
-  history,
   onReasoning,
   onContent,
   onDone,
   onError,
+  signal,
 }: SendMessageParams): Promise<void> {
-  const historyItems = history
-    .filter((m) => m.role === "user" || m.role === "assistant")
-    .map((m) => ({ role: m.role, content: m.content }));
-
   const body = JSON.stringify({
+    session_id: sessionId,
     message,
     model,
-    history: historyItems,
   });
 
   let response: Response;
@@ -46,8 +94,12 @@ export async function sendMessage({
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body,
+      signal,
     });
-  } catch {
+  } catch (error) {
+    if (error instanceof DOMException && error.name === "AbortError") {
+      return;
+    }
     onError("网络连接失败，请检查后端服务是否启动");
     return;
   }
@@ -98,17 +150,20 @@ export async function sendMessage({
             if (event.token) onContent(event.token);
             break;
           case "done":
-            onDone(event.usage ?? undefined);
+            await onDone(event.usage ?? undefined);
             return;
           case "error":
-            onError(event.message ?? "未知错误");
+            await onError(event.message ?? "未知错误");
             return;
         }
       }
     }
 
-    onDone();
-  } catch {
-    onError("流式读取中断");
+    await onDone();
+  } catch (error) {
+    if (error instanceof DOMException && error.name === "AbortError") {
+      return;
+    }
+    await onError("流式读取中断");
   }
 }

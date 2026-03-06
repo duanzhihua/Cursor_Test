@@ -13,6 +13,7 @@ export default function ChatPage() {
     messages,
     selectedModel,
     isLoading,
+    isSessionLoading,
     sidebarOpen,
     setSidebarOpen,
     toggleSidebar,
@@ -76,7 +77,11 @@ export default function ChatPage() {
         </div>
 
         {/* Messages */}
-        {messages.length === 0 ? (
+        {isSessionLoading && messages.length === 0 ? (
+          <div className="flex-1 flex items-center justify-center text-sm text-gray-500">
+            正在加载会话...
+          </div>
+        ) : messages.length === 0 ? (
           <WelcomeScreen onExampleClick={handleExampleClick} />
         ) : (
           <div className="flex-1 overflow-y-auto">
@@ -92,7 +97,7 @@ export default function ChatPage() {
         {/* Input */}
         <ChatInput
           onSend={sendUserMessage}
-          isLoading={isLoading}
+          isLoading={isLoading || isSessionLoading}
           selectedModel={selectedModel}
           onModelChange={setModel}
         />

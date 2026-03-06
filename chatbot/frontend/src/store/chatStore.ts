@@ -1,7 +1,15 @@
 import { create } from "zustand";
-import type { Message, Session, ModelType, ModelInfo } from "../types";
+import type { Message, ModelInfo, ModelType, Session } from "../types";
 import { DEFAULT_MODELS } from "../types";
-import { sendMessage, fetchModels } from "../services/api";
+import {
+  createSession as createSessionApi,
+  deleteSession as deleteSessionApi,
+  fetchModels,
+  fetchSessionDetail,
+  fetchSessions,
+  renameSession as renameSessionApi,
+  sendMessage,
+} from "../services/api";
 
 interface ChatState {
   sessions: Session[];
@@ -10,27 +18,32 @@ interface ChatState {
   selectedModel: ModelType;
   availableModels: ModelInfo[];
   isLoading: boolean;
+  isSessionLoading: boolean;
   sidebarOpen: boolean;
 
   setSidebarOpen: (open: boolean) => void;
   toggleSidebar: () => void;
   setModel: (model: ModelType) => void;
+  initializeApp: () => Promise<void>;
   loadModels: () => Promise<void>;
-  switchSession: (sessionId: string) => void;
-  createSession: () => string;
-  deleteSession: (sessionId: string) => void;
-  renameSession: (sessionId: string, title: string) => void;
-  sendUserMessage: (content: string) => void;
+  loadSessions: () => Promise<void>;
+  switchSession: (sessionId: string) => Promise<void>;
+  createSession: () => Promise<string | null>;
+  deleteSession: (sessionId: string) => Promise<void>;
+  renameSession: (sessionId: string, title: string) => Promise<void>;
+  sendUserMessage: (content: string) => Promise<void>;
   abortCurrentRequest: () => void;
 }
 
 const sessionMessages: Record<string, Message[]> = {};
-
-let nextSessionNum = 1;
-let currentAbort: (() => void) | null = null;
+let currentAbortController: AbortController | null = null;
 
 function generateId() {
   return `id-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function isModelType(model?: string): model is ModelType {
+  return model === "deepseek-chat" || model === "deepseek-reasoner";
 }
 
 export const useChatStore = create<ChatState>((set, get) => ({
@@ -40,12 +53,17 @@ export const useChatStore = create<ChatState>((set, get) => ({
   selectedModel: "deepseek-chat",
   availableModels: DEFAULT_MODELS,
   isLoading: false,
+  isSessionLoading: false,
   sidebarOpen: true,
 
   setSidebarOpen: (open) => set({ sidebarOpen: open }),
   toggleSidebar: () => set((s) => ({ sidebarOpen: !s.sidebarOpen })),
 
   setModel: (model) => set({ selectedModel: model }),
+
+  initializeApp: async () => {
+    await Promise.all([get().loadModels(), get().loadSessions()]);
+  },
 
   loadModels: async () => {
     const models = await fetchModels();
@@ -54,94 +72,122 @@ export const useChatStore = create<ChatState>((set, get) => ({
     }
   },
 
-  switchSession: (sessionId) => {
-    set({
-      currentSessionId: sessionId,
-      messages: sessionMessages[sessionId] ?? [],
-    });
-  },
+  loadSessions: async () => {
+    try {
+      const sessions = await fetchSessions();
+      const currentSessionId = get().currentSessionId;
+      const nextSessionId = currentSessionId && sessions.some((s) => s.id === currentSessionId)
+        ? currentSessionId
+        : (sessions[0]?.id ?? null);
 
-  createSession: () => {
-    const id = generateId();
-    const now = new Date().toISOString();
-    const session: Session = {
-      id,
-      title: `新对话 ${nextSessionNum++}`,
-      created_at: now,
-      updated_at: now,
-    };
-    sessionMessages[id] = [];
-    set((s) => ({
-      sessions: [session, ...s.sessions],
-      currentSessionId: id,
-      messages: [],
-    }));
-    return id;
-  },
-
-  deleteSession: (sessionId) => {
-    delete sessionMessages[sessionId];
-    set((s) => {
-      const sessions = s.sessions.filter((sess) => sess.id !== sessionId);
-      const needSwitch = s.currentSessionId === sessionId;
-      return {
+      set({
         sessions,
-        currentSessionId: needSwitch ? (sessions[0]?.id ?? null) : s.currentSessionId,
-        messages: needSwitch ? (sessionMessages[sessions[0]?.id] ?? []) : s.messages,
-      };
-    });
+        currentSessionId: nextSessionId,
+        messages: nextSessionId ? (sessionMessages[nextSessionId] ?? []) : [],
+      });
+
+      if (nextSessionId) {
+        await get().switchSession(nextSessionId);
+      }
+    } catch (error) {
+      console.error("Failed to load sessions", error);
+    }
   },
 
-  renameSession: (sessionId, title) => {
+  switchSession: async (sessionId) => {
+    set({ currentSessionId: sessionId, isSessionLoading: true });
+
+    try {
+      const detail = await fetchSessionDetail(sessionId);
+      sessionMessages[sessionId] = detail.messages;
+      set((s) => ({
+        currentSessionId: sessionId,
+        messages: detail.messages,
+        isSessionLoading: false,
+        selectedModel: isModelType(detail.default_model) ? detail.default_model : s.selectedModel,
+        sessions: s.sessions.map((session) =>
+          session.id === detail.id ? { ...session, ...detail } : session,
+        ),
+      }));
+    } catch (error) {
+      console.error("Failed to load session detail", error);
+      set({ isSessionLoading: false });
+    }
+  },
+
+  createSession: async () => {
+    try {
+      const session = await createSessionApi(get().selectedModel);
+      sessionMessages[session.id] = [];
+      set((s) => ({
+        sessions: [session, ...s.sessions],
+        currentSessionId: session.id,
+        messages: [],
+      }));
+      return session.id;
+    } catch (error) {
+      console.error("Failed to create session", error);
+      return null;
+    }
+  },
+
+  deleteSession: async (sessionId) => {
+    await deleteSessionApi(sessionId);
+    delete sessionMessages[sessionId];
+    const remaining = get().sessions.filter((session) => session.id !== sessionId);
+    const nextSessionId = get().currentSessionId === sessionId ? (remaining[0]?.id ?? null) : get().currentSessionId;
+
+    set({
+      sessions: remaining,
+      currentSessionId: nextSessionId,
+      messages: nextSessionId && nextSessionId !== sessionId ? (sessionMessages[nextSessionId] ?? []) : [],
+    });
+
+    if (nextSessionId) {
+      await get().switchSession(nextSessionId);
+    }
+  },
+
+  renameSession: async (sessionId, title) => {
+    const updated = await renameSessionApi(sessionId, title);
     set((s) => ({
-      sessions: s.sessions.map((sess) =>
-        sess.id === sessionId
-          ? { ...sess, title, updated_at: new Date().toISOString() }
-          : sess,
+      sessions: s.sessions.map((session) =>
+        session.id === sessionId ? { ...session, ...updated } : session,
       ),
     }));
   },
 
   abortCurrentRequest: () => {
-    if (currentAbort) {
-      currentAbort();
-      currentAbort = null;
+    if (currentAbortController) {
+      currentAbortController.abort();
+      currentAbortController = null;
     }
     set({ isLoading: false });
   },
 
-  sendUserMessage: (content) => {
+  sendUserMessage: async (content) => {
     const { selectedModel } = get();
     let { currentSessionId } = get();
+    const trimmed = content.trim();
 
-    if (!content.trim()) return;
+    if (!trimmed || get().isLoading) return;
 
     if (!currentSessionId) {
-      const id = generateId();
-      const now = new Date().toISOString();
-      const session: Session = {
-        id,
-        title: content.trim().slice(0, 20) || `新对话 ${nextSessionNum++}`,
-        created_at: now,
-        updated_at: now,
-      };
-      sessionMessages[id] = [];
-      set((s) => ({
-        sessions: [session, ...s.sessions],
-        currentSessionId: id,
-        messages: [],
-      }));
-      currentSessionId = id;
+      currentSessionId = await get().createSession();
+    }
+
+    if (!currentSessionId) {
+      return;
     }
 
     const userMsg: Message = {
       id: generateId(),
       role: "user",
-      content: content.trim(),
+      content: trimmed,
       created_at: new Date().toISOString(),
     };
 
-    const prevMessages = get().messages;
+    const prevMessages = [...(sessionMessages[currentSessionId] ?? [])];
     const withUser = [...prevMessages, userMsg];
     sessionMessages[currentSessionId] = withUser;
 
@@ -160,73 +206,79 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
     const withAi = [...withUser, aiMsg];
     sessionMessages[currentSessionId] = withAi;
-    set({ messages: withAi, isLoading: true });
-
-    let aborted = false;
-    currentAbort = () => { aborted = true; };
+    if (get().currentSessionId === currentSessionId) {
+      set({ messages: withAi });
+    }
+    set({ isLoading: true });
 
     const sessId = currentSessionId;
+    const controller = new AbortController();
+    currentAbortController = controller;
 
-    sendMessage({
-      message: content.trim(),
+    const updateSessionMessages = (updater: (messages: Message[]) => Message[]) => {
+      const nextMessages = updater(sessionMessages[sessId] ?? []);
+      sessionMessages[sessId] = nextMessages;
+      if (get().currentSessionId === sessId) {
+        set({ messages: nextMessages });
+      }
+    };
+
+    await sendMessage({
+      sessionId: sessId,
+      message: trimmed,
       model: selectedModel,
-      history: prevMessages,
+      signal: controller.signal,
 
       onReasoning: (token) => {
-        if (aborted) return;
-        const msgs = get().messages.map((m) =>
+        updateSessionMessages((messages) => messages.map((m) =>
           m.id === aiMsgId
             ? { ...m, reasoning_content: (m.reasoning_content ?? "") + token, isThinking: true }
             : m,
-        );
-        sessionMessages[sessId] = msgs;
-        set({ messages: msgs });
+        ));
       },
 
       onContent: (token) => {
-        if (aborted) return;
-        const msgs = get().messages.map((m) =>
+        updateSessionMessages((messages) => messages.map((m) =>
           m.id === aiMsgId
             ? { ...m, content: m.content + token, isThinking: false }
             : m,
-        );
-        sessionMessages[sessId] = msgs;
-        set({ messages: msgs });
+        ));
       },
 
-      onDone: () => {
-        if (aborted) return;
-        currentAbort = null;
-        const msgs = get().messages.map((m) =>
+      onDone: async () => {
+        if (currentAbortController === controller) {
+          currentAbortController = null;
+        }
+
+        updateSessionMessages((messages) => messages.map((m) =>
           m.id === aiMsgId
             ? { ...m, isStreaming: false, isThinking: false }
             : m,
-        );
-        sessionMessages[sessId] = msgs;
+        ));
 
-        const title = get().sessions.find((s) => s.id === sessId)?.title;
-        const isDefaultTitle = title?.startsWith("新对话");
-        const firstUserContent = userMsg.content.slice(0, 20);
-
-        set((s) => ({
-          messages: msgs,
-          isLoading: false,
-          sessions: s.sessions.map((sess) =>
-            sess.id === sessId
-              ? {
-                  ...sess,
-                  title: isDefaultTitle && firstUserContent ? firstUserContent : sess.title,
-                  updated_at: new Date().toISOString(),
-                }
-              : sess,
-          ),
-        }));
+        try {
+          const [sessions, detail] = await Promise.all([
+            fetchSessions(),
+            fetchSessionDetail(sessId),
+          ]);
+          sessionMessages[sessId] = detail.messages;
+          set({
+            sessions,
+            messages: get().currentSessionId === sessId ? detail.messages : get().messages,
+            isLoading: false,
+          });
+        } catch (error) {
+          console.error("Failed to refresh session after response", error);
+          set({ isLoading: false });
+        }
       },
 
-      onError: (errorMsg) => {
-        if (aborted) return;
-        currentAbort = null;
-        const msgs = get().messages.map((m) =>
+      onError: async (errorMsg) => {
+        if (currentAbortController === controller) {
+          currentAbortController = null;
+        }
+
+        updateSessionMessages((messages) => messages.map((m) =>
           m.id === aiMsgId
             ? {
                 ...m,
@@ -235,9 +287,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
                 isThinking: false,
               }
             : m,
-        );
-        sessionMessages[sessId] = msgs;
-        set({ messages: msgs, isLoading: false });
+        ));
+        set({ isLoading: false });
       },
     });
   },

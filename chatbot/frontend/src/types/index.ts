@@ -14,8 +14,13 @@ export interface Message {
 export interface Session {
   id: string;
   title: string;
+  default_model?: ModelType;
   created_at: string;
   updated_at: string;
+}
+
+export interface SessionDetail extends Session {
+  messages: Message[];
 }
 
 export interface ModelInfo {

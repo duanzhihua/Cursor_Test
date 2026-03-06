@@ -3,11 +3,11 @@ import ChatPage from "./pages/ChatPage";
 import { useChatStore } from "./store/chatStore";
 
 function App() {
-  const loadModels = useChatStore((s) => s.loadModels);
+  const initializeApp = useChatStore((s) => s.initializeApp);
 
   useEffect(() => {
-    loadModels();
-  }, [loadModels]);
+    initializeApp();
+  }, [initializeApp]);
 
   return <ChatPage />;
 }
